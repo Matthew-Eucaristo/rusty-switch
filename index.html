@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rusty Switch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Saira+Stencil+One&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#5d6a62;
+    --ink:rgba(18,24,21,.62);
+    --ink-strong:rgba(18,24,21,.85);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){ --bg:#060504; --ink:rgba(255,140,70,.55); --ink-strong:rgba(255,160,90,.85); }
+  }
+  :root[data-theme="dark"]{ --bg:#060504; --ink:rgba(255,140,70,.55); --ink-strong:rgba(255,160,90,.85); }
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);transition:background .6s;}
+  body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;}
+  #gl{cursor:grab;touch-action:none;outline:none;}
+  #gl.grabbing{cursor:grabbing;}
+  #fx{pointer-events:none;}
+  #hint{
+    position:fixed;left:16px;right:16px;bottom:28px;text-align:center;pointer-events:none;
+    font:15px/1.2 "Saira Stencil One",Impact,sans-serif;letter-spacing:.32em;color:var(--ink);
+    opacity:0;transform:translateY(6px);transition:opacity .5s,transform .5s,color .6s;
+  }
+  #hint.show{opacity:1;transform:none;}
+  @media (max-width:520px){ #hint{font-size:12px;letter-spacing:.18em;bottom:22px;} }
+  #snd{
+    position:fixed;top:14px;right:16px;background:none;border:0;padding:8px 4px;cursor:pointer;
+    font:12px/1 "Share Tech Mono",ui-monospace,monospace;letter-spacing:.2em;color:var(--ink);transition:color .6s;
+  }
+  #snd:hover,#snd:focus-visible{color:var(--ink-strong);outline:none;}
+  #err{position:fixed;inset:0;display:none;place-items:center;color:#ccc;font:14px "Share Tech Mono",monospace;padding:24px;text-align:center;}
+</style>
+</head>
+<body>
+<canvas id="gl" role="switch" aria-checked="false" aria-label="Dark mode" tabindex="0"></canvas>
+<canvas id="fx" aria-hidden="true"></canvas>
+<div id="hint" aria-live="polite"></div>
+<button id="snd" aria-pressed="true">SOUND ON</button>
+<div id="err">This needs WebGL2. The switch rusted shut.</div>
+
+<script>
+(() => {
+'use strict';
+
+/* ------------------------------------------------------------------ *
+ *  SHADERS
+ * ------------------------------------------------------------------ */
+const VS = `#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position = vec4(p*2.0-1.0,0.0,1.0); }`;
+
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform vec2 uRes; uniform float uTime;
+uniform vec3 uEye, uTgt; uniform float uFl;
+uniform vec3 uLd, uLn;
+uniform float uMain, uGlow, uPilot, uFlash, uNight, uExpo;
+uniform sampler2D uLabel;
+
+const vec2 SC = vec2(0.0, 0.15);
+const float SH = 0.40, SR = 0.085, PZ = 0.07;
+const vec3 PIV = vec3(0.0, 0.15, -0.55);
+const vec2 LAMP = vec2(0.0, -0.55);
+const vec3 GLOW = vec3(1.0, 0.36, 0.07);
+
+float hash13(vec3 p3){ p3 = fract(p3*0.1031); p3 += dot(p3, p3.zyx+31.32); return fract((p3.x+p3.y)*p3.z); }
+float vnoise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash13(i),hash13(i+vec3(1,0,0)),f.x), mix(hash13(i+vec3(0,1,0)),hash13(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash13(i+vec3(0,0,1)),hash13(i+vec3(1,0,1)),f.x), mix(hash13(i+vec3(0,1,1)),hash13(i+vec3(1,1,1)),f.x),f.y), f.z);
+}
+float fbm(vec3 p){ float s=0.0,a=0.5; for(int i=0;i<5;i++){ s+=a*vnoise(p); p=p*2.02+vec3(3.1,1.7,7.3); a*=0.5; } return s/0.96875; }
+float fbm3(vec3 p){ float s=0.0,a=0.5; for(int i=0;i<3;i++){ s+=a*vnoise(p); p=p*2.03+vec3(1.3,5.7,2.9); a*=0.5; } return s/0.875; }
+
+float smin(float a,float b,float k){ float h=clamp(0.5+0.5*(b-a)/k,0.0,1.0); return mix(b,a,h)-k*h*(1.0-h); }
+float smax(float a,float b,float k){ return -smin(-a,-b,k); }
+float sdRoundBox(vec3 p, vec3 b, float r){ vec3 q=abs(p)-b+r; return length(max(q,0.0))+min(max(q.x,max(q.y,q.z)),0.0)-r; }
+float sdBox3(vec3 p, vec3 b){ vec3 q=abs(p)-b; return length(max(q,0.0))+min(max(q.x,max(q.y,q.z)),0.0); }
+float sdBox2(vec2 p, vec2 b){ vec2 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,d.y),0.0); }
+float sdPill(vec2 p, float h, float r){ p.y -= clamp(p.y,-h,h); return length(p)-r; }
+float sdEllipsoid(vec3 p, vec3 r){ float k0=length(p/r); float k1=length(p/(r*r)); return k0*(k0-1.0)/k1; }
+
+vec2 map(vec3 p){
+  float dw = p.z;
+  float dp = sdRoundBox(p, vec3(0.75,1.05,PZ), 0.03);
+  float ds = sdPill(p.xy-SC, SH, SR);
+  float r2 = abs(ds-0.038)-0.03;
+  vec2 wq = vec2(r2+0.012, abs(p.z-(PZ+0.012))-0.024+0.012);
+  float drim = min(max(wq.x,wq.y),0.0)+length(max(wq,0.0))-0.012;
+  float dpl = smin(dp, drim, 0.014);
+  float st = min(dw, dpl);
+  float id = dw<dpl ? 1.0 : (drim<dp ? 3.0 : 2.0);
+  float hole = max(ds, -(p.z+0.40));
+  if(-hole > st) id = 9.0;
+  st = smax(st, -hole, 0.01);
+  vec2 res = vec2(st, id);
+
+  // screws
+  vec2 sg = sign(p.xy);
+  vec3 sq = vec3(abs(p.x)-0.6, abs(p.y)-0.92, p.z-PZ);
+  float dsc = sdEllipsoid(sq, vec3(0.062,0.062,0.03));
+  float ang = hash13(vec3(sg*7.0, 3.0))*3.14159;
+  float ca=cos(ang), sa=sin(ang);
+  vec2 rq = mat2(ca,-sa,sa,ca)*sq.xy;
+  dsc = max(dsc, -sdBox3(vec3(rq, sq.z-0.03), vec3(0.08,0.009,0.022)));
+  if(dsc < res.x) res = vec2(dsc, 4.0);
+
+  // pilot lamp
+  vec3 lq = vec3(p.xy-LAMP, p.z-PZ);
+  float dbz = length(vec2(length(lq.xy)-0.09, lq.z)) - 0.026;
+  if(dbz < res.x) res = vec2(dbz, 8.0);
+  float dgl = length(lq + vec3(0.0,0.0,0.01)) - 0.072;
+  if(dgl < res.x) res = vec2(dgl, 7.0);
+
+  // lever
+  vec3 q = p - PIV;
+  float bd = length(q - uLd*0.75) - 0.82;
+  if(bd < res.x){
+    float al = dot(q, uLd);
+    float rl = length(q - uLd*al);
+    float drod = length(q - uLd*clamp(al, 0.0, 1.25)) - 0.048;
+    vec2 cw = vec2(rl-0.066+0.008, abs(al-1.17)-0.06+0.008);
+    float dcol = min(max(cw.x,cw.y),0.0)+length(max(cw,0.0))-0.008;
+    float dk = length(q - uLd*1.35) - 0.138;
+    if(drod < res.x) res = vec2(drod, 5.0);
+    if(dcol < res.x) res = vec2(dcol, 10.0);
+    if(dk < res.x) res = vec2(dk, 6.0);
+  }
+  return res;
+}
+
+vec3 calcNormal(vec3 p){
+  const vec2 e = vec2(1.0,-1.0)*0.0006;
+  return normalize(e.xyy*map(p+e.xyy).x + e.yyx*map(p+e.yyx).x + e.yxy*map(p+e.yxy).x + e.xxx*map(p+e.xxx).x);
+}
+float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k){
+  float res=1.0, t=mint;
+  for(int i=0;i<48;i++){
+    float h = map(ro+rd*t).x;
+    res = min(res, k*h/t);
+    t += clamp(h, 0.008, 0.2);
+    if(res<0.002 || t>maxt) break;
+  }
+  return clamp(res,0.0,1.0);
+}
+float calcAO(vec3 p, vec3 n){
+  float o=0.0, s=1.0;
+  for(int i=0;i<5;i++){ float h=0.008+0.045*float(i); float d=map(p+n*h).x; o+=(h-d)*s; s*=0.72; }
+  return clamp(1.0-2.6*o, 0.0, 1.0);
+}
+vec3 bumpN(vec3 n, vec3 p, float freq, float amp){
+  const float e = 0.0025;
+  float h0 = fbm3(p*freq);
+  vec3 g = vec3(fbm3((p+vec3(e,0,0))*freq)-h0, fbm3((p+vec3(0,e,0))*freq)-h0, fbm3((p+vec3(0,0,e))*freq)-h0)/e;
+  g -= n*dot(g,n);
+  return normalize(n - amp*g);
+}
+vec3 bumpL(vec3 n, vec3 lp, float freq, float amp){
+  const float e = 0.0025;
+  float h0 = fbm3(lp*freq);
+  vec3 gl = vec3(fbm3((lp+vec3(e,0,0))*freq)-h0, fbm3((lp+vec3(0,e,0))*freq)-h0, fbm3((lp+vec3(0,0,e))*freq)-h0)/e;
+  vec3 g = vec3(gl.x,0.0,0.0) + gl.y*uLn + gl.z*uLd;
+  g -= n*dot(g,n);
+  return normalize(n - amp*g);
+}
+vec3 brdf(vec3 alb, float rough, float metal, vec3 n, vec3 v, vec3 l){
+  float ndl = dot(n,l);
+  if(ndl<=0.0) return vec3(0.0);
+  vec3 h = normalize(l+v);
+  float ndh = max(dot(n,h),0.0), ndv = max(dot(n,v),1e-3), vdh = max(dot(v,h),0.0);
+  float a = rough*rough, a2 = a*a;
+  float dd = ndh*ndh*(a2-1.0)+1.0;
+  float D = a2/(3.14159*dd*dd);
+  vec3 F0 = mix(vec3(0.04), alb, metal);
+  vec3 F = F0 + (1.0-F0)*pow(1.0-vdh,5.0);
+  float k = (rough+1.0)*(rough+1.0)/8.0;
+  float G = (ndv/(ndv*(1.0-k)+k))*(ndl/(ndl*(1.0-k)+k));
+  vec3 spec = D*F*G/(4.0*ndv*ndl+1e-4);
+  vec3 kd = (1.0-F)*(1.0-metal);
+  return (kd*alb/3.14159 + spec)*ndl;
+}
+vec3 rustCol(float n2, float n3){
+  vec3 rc = mix(vec3(0.085,0.035,0.016), vec3(0.34,0.14,0.045), smoothstep(0.2,0.8,n2));
+  rc = mix(rc, vec3(0.52,0.25,0.07), smoothstep(0.78,0.95,n3)*0.45);
+  return rc*(0.7+0.55*n3);
+}
+
+vec3 shade(vec3 p, vec3 rd, float idf){
+  int id = int(idf+0.5);
+  vec3 ng = calcNormal(p);
+  vec3 nn = ng;
+  vec3 alb = vec3(0.5); float rough = 0.6, metal = 0.0; vec3 emi = vec3(0.0);
+
+  if(id==1){ // ---- painted concrete wall
+    vec2 w = p.xy;
+    float big = fbm(vec3(w*0.9, 9.0));
+    float n2 = fbm(vec3(w*9.0, 2.0));
+    float n3 = vnoise(vec3(w*60.0, 4.0));
+    vec3 paint = mix(vec3(0.22,0.28,0.245), vec3(0.34,0.39,0.34), big)*(0.9+0.15*n3);
+    paint *= 0.82 + 0.3*fbm(vec3(w.x*1.5, w.y*6.0, 13.0));
+    float dado = smoothstep(-1.215,-1.225, w.y);
+    paint = mix(paint, vec3(0.10,0.17,0.13)*(0.85+0.3*n2), dado);
+    paint = mix(paint, vec3(0.05,0.07,0.06), smoothstep(0.012,0.004,abs(w.y+1.22)));
+    float pn = fbm(vec3(w*2.6, 4.0)) + 0.12*n2;
+    float peel = smoothstep(0.72, 0.74, pn);
+    float peelEdge = smoothstep(0.69, 0.72, pn)*(1.0-peel);
+    vec3 conc = vec3(0.30,0.285,0.26)*(0.6+0.55*n2)*(0.85+0.3*n3);
+    alb = mix(paint, conc, peel);
+    float dpl = sdBox2(w, vec2(0.75,1.05));
+    alb *= 1.0 - 0.4*exp(-max(dpl,0.0)*9.0);
+    float below = -1.05 - w.y;
+    if(below > 0.0 && abs(w.x) < 0.9){
+      float sn = fbm(vec3(w.x*18.0, w.y*0.8, 3.0));
+      float s = smoothstep(0.5,0.85,sn)*exp(-below*1.8)*smoothstep(0.85,0.7,abs(w.x));
+      s = max(s, exp(-pow((w.x+0.6)/(0.02+0.06*below),2.0))*exp(-below*0.8)*(0.6+0.5*sn));
+      s = max(s, exp(-pow((w.x-0.6)/(0.02+0.06*below),2.0))*exp(-below*0.8)*(0.6+0.5*sn));
+      s = max(s, exp(-pow(w.x/(0.03+0.07*below),2.0))*exp(-below*1.1)*(0.5+0.6*sn)*0.8);
+      alb = mix(alb, vec3(0.16,0.07,0.03)*(0.8+0.4*n2), clamp(s*0.75,0.0,0.7));
+    }
+    rough = mix(mix(0.78,0.55,dado), 0.95, peel);
+    alb += peelEdge*0.07;
+    nn = bumpN(nn, p, 14.0, 0.0008 + peelEdge*0.006 + peel*0.002);
+  }
+  else if(id==2 || id==3){ // ---- faceplate + slot rim
+    vec2 w = p.xy;
+    float e = -sdBox2(w, vec2(0.75,1.05));
+    float n1 = fbm(vec3(w*4.0, 1.3));
+    float n2 = fbm(vec3(w*14.0, 5.1));
+    float n3 = vnoise(vec3(w*70.0, 2.2));
+    float dsc = length(vec2(abs(w.x)-0.6, abs(w.y)-0.92));
+    float ds = sdPill(w-SC, SH, SR);
+    float drip = 0.0;
+    for(int k=0;k<2;k++){
+      float sx = k==0 ? -0.6 : 0.6;
+      float bl = 0.92 - w.y;
+      if(bl > 0.0) drip += exp(-pow((w.x-sx)/(0.012+0.05*bl),2.0))*exp(-bl*2.4)*(0.5+n2);
+    }
+    float bs = (SC.y-SH-SR) - w.y;
+    if(bs > 0.0) drip += exp(-pow(w.x/(0.03+0.09*bs),2.0))*exp(-bs*2.0)*(0.4+n2)*0.9;
+    float rr = n1*0.9 + n2*0.25 + smoothstep(0.16,0.0,e)*0.5 + smoothstep(0.18,0.065,dsc)*0.55
+             + smoothstep(0.14,0.03,ds)*0.32 + drip*0.45;
+    float rm = smoothstep(0.80, 0.86, rr + 0.12*(n3-0.5));
+    float flake = smoothstep(0.74, 0.80, rr)*(1.0-rm);
+    vec3 paint = vec3(0.12,0.165,0.15)*(0.8+0.35*n2)*(0.92+0.16*n3);
+    paint = mix(paint, paint*1.35+0.02, smoothstep(0.55,0.75,n1)*0.5);
+    float blister = smoothstep(0.62,0.7,fbm(vec3(w*38.0,8.0)))*smoothstep(0.55,0.75,rr);
+    rm = max(rm, blister*0.85);
+    alb = mix(paint, rustCol(n2,n3), rm);
+    alb = mix(alb, vec3(0.28,0.11,0.04), clamp(drip*0.6,0.0,0.7)*(1.0-rm));
+    rough = mix(0.48, 0.93, rm);
+
+    if(id==2 && ng.z > 0.9 && p.z > PZ-0.004){
+      vec2 luv = vec2((w.x+0.75)/1.5, (1.05-w.y)/2.1);
+      vec4 L = texture(uLabel, luv);
+      float wear = smoothstep(0.55, 0.8, n2 + rm*0.5 + n3*0.15);
+      float lm = smoothstep(0.78,0.95,L.r)*(1.0-wear);
+      alb = mix(alb, vec3(0.80,0.74,0.60)*(0.85+0.2*n3), lm);
+      rough = mix(rough, 0.42, lm);
+      float sw = 1.0 - smoothstep(0.5,0.85,n2+rm*0.6);
+      alb = mix(alb, vec3(0.80,0.55,0.06)*(0.85+0.2*n3), L.g*sw);
+      alb = mix(alb, vec3(0.03), L.b*(1.0-L.g)*sw);
+      float du = 1.0/768.0, dv = 1.0/1075.0;
+      float hx = (texture(uLabel,luv+vec2(du,0.0)).r - texture(uLabel,luv-vec2(du,0.0)).r)/(2.0*du*1.5);
+      float hy = (texture(uLabel,luv-vec2(0.0,dv)).r - texture(uLabel,luv+vec2(0.0,dv)).r)/(2.0*dv*2.1);
+      nn = normalize(nn + vec3(-hx,-hy,0.0)*0.0032);
+    }
+    if(id==3){
+      float bare = clamp(smoothstep(0.45,0.62,n2)*0.75*(1.0-rm) + smoothstep(0.035,0.0,ds)*0.85*(1.0-rm*0.7), 0.0, 1.0);
+      bare *= smoothstep(0.2,0.8,ng.z) + smoothstep(0.03,0.0,ds);
+      bare = clamp(bare,0.0,1.0);
+      vec3 steel = vec3(0.56,0.55,0.52)*(0.78+0.35*n3);
+      alb = mix(alb, steel, bare); metal = bare; rough = mix(rough, 0.28, bare);
+    }
+    alb += flake*0.05;
+    nn = bumpN(nn, p, 22.0, mix(0.0006, 0.0042, rm) + flake*0.003);
+  }
+  else if(id==4){ // ---- screws
+    float n2 = fbm(p*30.0), n3 = vnoise(p*90.0);
+    float rm = smoothstep(0.35,0.55,n2);
+    alb = mix(vec3(0.30,0.29,0.28), rustCol(n2,n3), rm);
+    metal = 1.0-rm; rough = mix(0.42,0.9,rm);
+    nn = bumpN(nn, p, 40.0, 0.002);
+  }
+  else if(id==9){ // ---- cavity
+    alb = vec3(0.05,0.042,0.035)*(0.6+0.6*fbm(p*20.0)); rough = 0.9;
+    float depth = smoothstep(0.05,-0.40,p.z);
+    float fl = 0.7+0.6*vnoise(vec3(p.xy*10.0, uTime*2.5));
+    emi = GLOW*uGlow*(depth*depth*1.1)*fl;
+  }
+  else if(id==5 || id==10 || id==6){ // ---- lever
+    vec3 q = p - PIV;
+    vec3 lp = vec3(q.x, dot(q,uLn), dot(q,uLd));
+    if(id==6){
+      float c = fbm(lp*6.0+vec3(2.0));
+      float chip = smoothstep(0.66,0.685,c);
+      vec3 red = vec3(0.34,0.028,0.02)*(0.82+0.35*fbm(lp*30.0));
+      alb = mix(red, vec3(0.022,0.018,0.016), chip);
+      float grime = smoothstep(0.65,0.9,fbm(lp*9.0+vec3(5.0)));
+      alb = mix(alb, vec3(0.08,0.05,0.03), grime*0.6);
+      rough = mix(0.16, 0.55, max(chip,grime)) + 0.08*vnoise(lp*60.0);
+      nn = bumpL(nn, lp, 26.0, 0.0012 + chip*0.003);
+    } else {
+      float n2 = fbm(lp*vec3(16.0,16.0,6.0));
+      float n3 = vnoise(lp*vec3(220.0,220.0,6.0));
+      float deep = smoothstep(0.7,0.45,lp.z);
+      float rm = smoothstep(id==10 ? 0.38 : 0.52, id==10 ? 0.52 : 0.66, n2 + 0.3*deep);
+      vec3 steel = vec3(0.56,0.55,0.53)*(0.82+0.25*n3);
+      alb = mix(steel, rustCol(n2,n3), rm);
+      metal = 1.0-rm; rough = mix(0.28,0.88,rm);
+      nn = bumpL(nn, lp, 30.0, 0.0015 + rm*0.003);
+    }
+  }
+  else if(id==7){ // ---- red jewel lens
+    vec3 lq = vec3(p.xy-LAMP, p.z-PZ);
+    nn = normalize(nn + 0.12*vec3(sin(lq.x*110.0), sin(lq.y*110.0), 0.0));
+    alb = vec3(0.26,0.012,0.008); rough = 0.07;
+    float facing = max(dot(nn,-rd),0.0);
+    float core = exp(-dot(lq.xy,lq.xy)*260.0);
+    emi = vec3(1.0,0.09,0.025)*uPilot*(0.8 + 3.0*core + 1.4*pow(facing,4.0));
+  }
+  else if(id==8){ // ---- lamp bezel
+    float n2 = fbm(p*40.0), n3 = vnoise(p*100.0);
+    float rm = smoothstep(0.55,0.7,n2);
+    alb = mix(vec3(0.68,0.66,0.63), rustCol(n2,n3), rm);
+    metal = 1.0-rm; rough = mix(0.2,0.85,rm);
+  }
+
+  // ---------------- lighting
+  vec3 V = -rd;
+  float ao = calcAO(p, ng);
+  vec3 c = vec3(0.0);
+  if(uMain > 0.002){
+    vec3 Lp = vec3(1.0, 3.6, 2.6);
+    vec3 Lv = Lp - p; float d2 = dot(Lv,Lv);
+    vec3 L = Lv*inversesqrt(d2);
+    float sh = softShadow(p + ng*0.003, L, 0.01, 5.0, 14.0);
+    c += brdf(alb,rough,metal,nn,V,L)*vec3(0.95,1.0,0.93)*uMain*5.0/(1.0+0.035*d2)*sh;
+  }
+  vec3 ambCol = vec3(0.68,0.75,0.73)*uMain*0.36 + vec3(0.20,0.28,0.46)*uNight*0.075;
+  float hemi = 0.62 + 0.38*nn.y;
+  vec3 F0 = mix(vec3(0.04),alb,metal);
+  vec3 R = reflect(rd, nn);
+  float env = 0.35 + 0.65*smoothstep(-0.2,0.8,R.y);
+  c += ambCol*ao*(alb*(1.0-metal)*hemi + F0*env*(1.0-rough*0.75)*1.1);
+
+  if(uGlow > 0.002){
+    vec3 Gp = vec3(0.0, 0.15, -0.18);
+    vec3 Lv = Gp - p; float d2 = dot(Lv,Lv);
+    vec3 L = Lv*inversesqrt(d2);
+    if(dot(nn,L) > 0.0){
+      float sh = softShadow(p + ng*0.003, L, 0.01, sqrt(d2)-0.03, 10.0);
+      c += brdf(alb,rough,metal,nn,V,L)*GLOW*uGlow*0.9/(d2*6.0+0.12)*sh;
+    }
+    if(id<=3){
+      float dsl = sdPill(p.xy-SC, SH, SR);
+      c += alb*GLOW*uGlow*0.7*exp(-max(dsl,0.0)*15.0)*ao;
+    }
+  }
+  if(uPilot > 0.002 && id!=7){
+    vec3 Pp = vec3(LAMP, PZ+0.09);
+    vec3 Lv = Pp - p; float d2 = dot(Lv,Lv);
+    c += brdf(alb,rough,metal,nn,V,Lv*inversesqrt(d2))*vec3(1.0,0.1,0.03)*uPilot*0.10/(d2+0.004);
+  }
+  if(uFlash > 0.002){
+    vec3 Fp = vec3(0.0, 0.15, 0.16);
+    vec3 Lv = Fp - p; float d2 = dot(Lv,Lv);
+    c += brdf(alb,rough,metal,nn,V,Lv*inversesqrt(d2))*vec3(0.75,0.85,1.0)*uFlash*1.3/(d2+0.03);
+  }
+  return c + emi;
+}
+
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes)/uRes.y;
+  vec3 f = normalize(uTgt-uEye), r = normalize(cross(f, vec3(0,1,0))), u = cross(r,f);
+  vec3 rd = normalize(uv.x*r + uv.y*u + uFl*f);
+  vec3 ro = uEye;
+  float t = 0.0; vec2 h = vec2(1.0); bool hit = false;
+  for(int i=0;i<160;i++){
+    h = map(ro+rd*t);
+    if(abs(h.x) < 0.0004*t){ hit = true; break; }
+    t += h.x*0.92;
+    if(t > 16.0) break;
+  }
+  vec3 col = vec3(0.0);
+  if(hit) col = shade(ro+rd*t, rd, h.y);
+  if(!hit) t = 1e4;
+
+  if(uGlow > 0.002){
+    float tz = (PZ+0.03 - ro.z)/rd.z;
+    if(tz > 0.0){
+      vec3 q = ro+rd*tz;
+      float dsl = max(sdPill(q.xy-SC, SH, SR), 0.0);
+      float occ = tz < t+0.02 ? 1.0 : 0.35;
+      col += GLOW*uGlow*(0.22*exp(-dsl*24.0) + 0.07*exp(-dsl*5.0))*occ;
+    }
+  }
+  if(uPilot > 0.002){
+    vec3 op = vec3(LAMP, PZ+0.04) - ro; float tp = dot(op, rd); float dr = length(op - rd*tp);
+    col += vec3(1.0,0.12,0.04)*uPilot*(0.45*exp(-dr*40.0) + 0.08*exp(-dr*7.0))*(tp < t+0.05 ? 1.0 : 0.3);
+  }
+  if(uFlash > 0.002){
+    vec3 op = vec3(0.0,0.15,0.14) - ro; float tp = dot(op, rd); float dr = length(op - rd*tp);
+    col += vec3(0.75,0.85,1.0)*uFlash*(0.9*exp(-dr*30.0) + 0.18*exp(-dr*4.0));
+  }
+
+  col *= uExpo;
+  col = aces(col);
+  col = pow(col, vec3(1.0/2.2));
+  vec2 q = gl_FragCoord.xy/uRes;
+  col *= 0.32 + 0.68*pow(16.0*q.x*q.y*(1.0-q.x)*(1.0-q.y), 0.24);
+  col += (hash13(vec3(gl_FragCoord.xy, fract(uTime*7.13)*97.0)) - 0.5)*0.045;
+  fragColor = vec4(max(col,0.0), 1.0);
+}`;
+
+/* ------------------------------------------------------------------ *
+ *  GL SETUP
+ * ------------------------------------------------------------------ */
+const cv = document.getElementById('gl');
+const fx = document.getElementById('fx');
+const fctx = fx.getContext('2d');
+const hintEl = document.getElementById('hint');
+const sndBtn = document.getElementById('snd');
+const gl = cv.getContext('webgl2', {antialias:false, alpha:false, powerPreference:'high-performance'});
+if(!gl){ document.getElementById('err').style.display='grid'; return; }
+
+function sh(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+try{
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+}catch(e){ console.error(e); const el=document.getElementById('err'); el.textContent='Shader failed: '+e.message; el.style.display='grid'; return; }
+gl.useProgram(prog);
+gl.bindVertexArray(gl.createVertexArray());
+const U = {};
+['uRes','uTime','uEye','uTgt','uFl','uLd','uLn','uMain','uGlow','uPilot','uFlash','uNight','uExpo','uLabel']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+/* ---- stamped label texture (R = raised letters, G = yellow, B = black) */
+const tex = gl.createTexture();
+function buildLabel(){
+  const W = 768, H = 1075, S = W/1.5;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d');
+  const X = v => (v+0.75)*S, Y = v => (1.05-v)*S;
+  x.fillStyle = '#000'; x.fillRect(0,0,W,H);
+  x.globalCompositeOperation = 'lighter';
+  x.textBaseline = 'middle';
+  function spaced(str, cx, cy, sp, maxW){
+    let ws = [...str].map(ch => x.measureText(ch).width);
+    let tot = ws.reduce((a,b)=>a+b,0) + sp*(str.length-1);
+    let sc = maxW && tot > maxW ? maxW/tot : 1;
+    x.save(); x.translate(cx, cy); x.scale(sc, 1);
+    let px = -tot/2;
+    [...str].forEach((ch,i) => { x.fillText(ch, px, 0); px += ws[i] + sp; });
+    x.restore();
+  }
+  const R = 'rgb(255,0,0)';
+  x.fillStyle = R; x.shadowColor = R; x.shadowBlur = 3;
+  x.font = `${Math.round(0.16*S)}px "Saira Stencil One", Impact, sans-serif`;
+  spaced('DARK MODE', X(0), Y(0.83), 0.022*S, 0.98*S);
+  x.font = `${Math.round(0.085*S)}px "Saira Stencil One", Impact, sans-serif`;
+  spaced('OFF', X(0.33), Y(0.47), 0.01*S);
+  spaced('ON', X(0.33), Y(-0.17), 0.01*S);
+  // tick marks beside slot ends
+  [[0.47],[-0.17]].forEach(([y]) => { x.fillRect(X(-0.29), Y(y)-0.012*S, 0.12*S, 0.024*S); });
+  x.font = `${Math.round(0.048*S)}px "Share Tech Mono", ui-monospace, monospace`;
+  spaced('TYPE 7-B  250V~  30A', X(0), Y(-0.755), 0.008*S);
+  spaced('DO NOT OPERATE UNDER LOAD', X(0), Y(-0.83), 0.006*S);
+  // raised border bead
+  x.shadowBlur = 4; x.strokeStyle = 'rgb(150,0,0)'; x.lineWidth = 0.012*S; x.shadowColor = 'rgb(150,0,0)';
+  const ins = 0.07*S; const rr = 0.06*S;
+  x.beginPath();
+  if(x.roundRect) x.roundRect(ins, ins, W-2*ins, H-2*ins, rr); else x.rect(ins, ins, W-2*ins, H-2*ins);
+  x.stroke();
+  // hazard stripes
+  x.shadowBlur = 0;
+  const x0 = X(-0.44), x1 = X(0.44), y0 = Y(-0.885), y1 = Y(-0.975);
+  x.save(); x.beginPath(); x.rect(x0, y0, x1-x0, y1-y0); x.clip();
+  x.fillStyle = 'rgb(0,0,255)'; x.fillRect(x0, y0, x1-x0, y1-y0);
+  x.fillStyle = 'rgb(0,255,0)';
+  const sw = 0.045*S, hgt = y1-y0;
+  for(let px = x0 - hgt; px < x1 + hgt; px += sw*2){
+    x.beginPath(); x.moveTo(px, y1); x.lineTo(px+sw, y1); x.lineTo(px+sw+hgt, y0); x.lineTo(px+hgt, y0); x.closePath(); x.fill();
+  }
+  x.restore();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+buildLabel();
+if(document.fonts && document.fonts.load){
+  Promise.race([
+    Promise.all([document.fonts.load('40px "Saira Stencil One"'), document.fonts.load('20px "Share Tech Mono"')]),
+    new Promise(r => setTimeout(r, 2500))
+  ]).then(buildLabel).catch(()=>{});
+}
+gl.uniform1i(U.uLabel, 0);
+
+/* ------------------------------------------------------------------ *
+ *  SOUND — everything synthesized
+ * ------------------------------------------------------------------ */
+const Snd = {
+  C:null, on:true,
+  init(){
+    if(this.C){ if(this.C.state === 'suspended') this.C.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext; if(!AC) return;
+    const C = this.C = new AC();
+    const comp = C.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.002; comp.release.value = 0.2;
+    this.master = C.createGain(); this.master.gain.value = this.on ? 0.85 : 0;
+    this.master.connect(comp); comp.connect(C.destination);
+    // noise
+    const len = C.sampleRate*2, nb = C.createBuffer(1, len, C.sampleRate), d = nb.getChannelData(0);
+    for(let i=0;i<len;i++) d[i] = Math.random()*2-1;
+    this.nb = nb;
+    // room reverb (concrete box)
+    const ir = C.createBuffer(2, C.sampleRate*1.4, C.sampleRate);
+    for(let ch=0; ch<2; ch++){ const b = ir.getChannelData(ch); for(let i=0;i<b.length;i++){ const tt=i/C.sampleRate; b[i]=(Math.random()*2-1)*Math.exp(-tt*4.2)*(tt<0.012?0.3:1); } }
+    const conv = C.createConvolver(); conv.buffer = ir;
+    const wet = C.createGain(); wet.gain.value = 0.22; conv.connect(wet); wet.connect(this.master);
+    this.out = C.createGain(); this.out.connect(this.master); this.out.connect(conv);
+    // saturation curve
+    const cu = new Float32Array(1024); for(let i=0;i<1024;i++){ const v=i/511.5-1; cu[i]=Math.tanh(2.6*v)/Math.tanh(2.6); } this.curve = cu;
+    // fluorescent hum
+    this.hum = C.createGain(); this.hum.gain.value = 0; this.hum.connect(this.master);
+    [[120,'sine',0.6],[240,'sine',0.22],[360,'sine',0.08]].forEach(([f,ty,a]) => { const o=C.createOscillator(); o.type=ty; o.frequency.value=f; const g=C.createGain(); g.gain.value=a; o.connect(g).connect(this.hum); o.start(); });
+    { const o=C.createOscillator(); o.type='sawtooth'; o.frequency.value=120; const lp=C.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=800; const g=C.createGain(); g.gain.value=0.1; o.connect(lp).connect(g).connect(this.hum); o.start(); }
+    // ember transformer buzz
+    this.buzz = C.createGain(); this.buzz.gain.value = 0; this.buzz.connect(this.master);
+    { const o=C.createOscillator(); o.type='sawtooth'; o.frequency.value=50; const lp=C.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=260; o.connect(lp).connect(this.buzz); o.start();
+      const o2=C.createOscillator(); o2.frequency.value=100; const g2=C.createGain(); g2.gain.value=0.5; o2.connect(g2).connect(this.buzz); o2.start(); }
+    // creak: sawtooth + noise through metal resonances
+    this.creakO = C.createOscillator(); this.creakO.type='sawtooth'; this.creakO.frequency.value=80;
+    const cn = C.createBufferSource(); cn.buffer = nb; cn.loop = true;
+    const cng = C.createGain(); cng.gain.value = 0.35;
+    const pre = C.createGain(); this.creakO.connect(pre); cn.connect(cng).connect(pre);
+    this.creakG = C.createGain(); this.creakG.gain.value = 0;
+    [[640,9,1],[1190,12,0.75],[2080,10,0.5],[3350,8,0.28]].forEach(([f,q,a]) => { const bp=C.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=f; bp.Q.value=q; const g=C.createGain(); g.gain.value=a*3.2; pre.connect(bp); bp.connect(g); g.connect(this.creakG); });
+    this.creakG.connect(this.out);
+    this.creakO.start(); cn.start();
+  },
+  setOn(v){ this.on = v; if(this.master) this.master.gain.setTargetAtTime(v?0.85:0, this.C.currentTime, 0.03); },
+  env(g, t, a, peak, dec){ peak = Math.max(peak, 1.2e-4); g.gain.setValueAtTime(1e-4, t); g.gain.exponentialRampToValueAtTime(peak, t+a); g.gain.exponentialRampToValueAtTime(1e-4, t+a+dec); },
+  nsrc(t, dur){ const s=this.C.createBufferSource(); s.buffer=this.nb; s.start(t, Math.random()*1.6, dur); return s; },
+  filt(type, f, q){ const b=this.C.createBiquadFilter(); b.type=type; b.frequency.value=f; if(q) b.Q.value=q; return b; },
+  clunk(s){
+    if(!this.C) return; const C=this.C, t=C.currentTime+0.002, o=this.out;
+    let os=C.createOscillator(), g=C.createGain();
+    os.frequency.setValueAtTime(130,t); os.frequency.exponentialRampToValueAtTime(42,t+0.18);
+    this.env(g,t,0.003,0.95*s,0.34); os.connect(g).connect(o); os.start(t); os.stop(t+0.45);
+    const sh=C.createWaveShaper(); sh.curve=this.curve; const sg=C.createGain(); sg.gain.value=0.55; sh.connect(sg).connect(o);
+    const modes=[[142,.55,.2],[297,.45,.16],[468,.38,.12],[733,.3,.09],[1126,.22,.07],[1648,.16,.05],[2412,.11,.035],[3560,.07,.02]];
+    for(const [f,a,d] of modes){
+      const m=C.createOscillator(); m.frequency.value=f*(0.96+Math.random()*0.08)*(0.92+0.16*(1-s));
+      const mg=C.createGain(); this.env(mg,t,0.001,a*s*0.55,d*(0.5+s*0.8)); m.connect(mg).connect(sh); m.start(t); m.stop(t+0.7);
+    }
+    const n=this.nsrc(t,0.2), lp=this.filt('lowpass',1800+2200*s), ng=C.createGain(); this.env(ng,t,0.001,0.9*s,0.07); n.connect(lp).connect(ng).connect(o);
+    const n2=this.nsrc(t+0.004,0.3), bp=this.filt('bandpass',3200,0.9), g2=C.createGain(); this.env(g2,t+0.004,0.002,0.4*s,0.16); n2.connect(bp).connect(g2).connect(o);
+    if(s>0.3){ const k=2+Math.floor(Math.random()*3); let tt=t+0.06; for(let i=0;i<k;i++){ this.tink(tt, s*0.2*(1-i/(k+1))); tt+=0.035+Math.random()*0.07; } }
+  },
+  tink(t, a){
+    const C=this.C;
+    const m=C.createOscillator(); m.frequency.value=1700+Math.random()*2400; const g=C.createGain(); this.env(g,t,0.001,a,0.045); m.connect(g).connect(this.out); m.start(t); m.stop(t+0.1);
+    const n=this.nsrc(t,0.03), hp=this.filt('highpass',2500), g2=C.createGain(); this.env(g2,t,0.001,a*0.7,0.012); n.connect(hp).connect(g2).connect(this.out);
+  },
+  grain(t, a){
+    const C=this.C; const src=this.nsrc(t,0.05);
+    const b1=this.filt('bandpass',650+Math.random()*900,8), b2=this.filt('bandpass',2000+Math.random()*1600,10);
+    const g=C.createGain(); this.env(g,t,0.001,a*3.2,0.035);
+    src.connect(b1); src.connect(b2); b1.connect(g); b2.connect(g); g.connect(this.out);
+    const k=C.createOscillator(); k.frequency.value=170+Math.random()*130; const kg=C.createGain(); this.env(kg,t,0.001,a*0.35,0.04); k.connect(kg).connect(this.out); k.start(t); k.stop(t+0.09);
+  },
+  krk(s){
+    if(!this.C) return; const t=this.C.currentTime;
+    const n=2+Math.floor(Math.random()*3+s*4); let tt=t;
+    for(let i=0;i<n;i++){ this.grain(tt, Math.min(1,s)*(0.35+0.65*Math.random())); tt+=0.008+Math.random()*0.026; }
+  },
+  arc(dur, s){
+    if(!this.C) return; const C=this.C, t=C.currentTime;
+    const src=C.createBufferSource(); src.buffer=this.nb; src.loop=true;
+    const hp=this.filt('highpass',1500); const g=C.createGain(); g.gain.setValueAtTime(0,t);
+    for(let x=0; x<dur; x+=0.003+Math.random()*0.018){ g.gain.setValueAtTime(s*(0.15+Math.random()*0.65),t+x); g.gain.setTargetAtTime(0,t+x+0.0015,0.003); }
+    src.connect(hp).connect(g).connect(this.out); src.start(t); src.stop(t+dur+0.05);
+    const bz=C.createOscillator(); bz.type='sawtooth'; bz.frequency.value=100;
+    const bb=this.filt('bandpass',900,1.5); const bg=C.createGain();
+    bg.gain.setValueAtTime(0,t); bg.gain.linearRampToValueAtTime(0.13*s,t+0.01); bg.gain.setTargetAtTime(0,t+dur*0.8,0.03);
+    bz.connect(bb).connect(bg).connect(this.out); bz.start(t); bz.stop(t+dur+0.25);
+  },
+  tick(a){
+    if(!this.C) return; const C=this.C, t=C.currentTime;
+    const n=this.nsrc(t,0.03), bp=this.filt('bandpass',2600,1.2), g=C.createGain(); this.env(g,t,0.001,a*0.7,0.02); n.connect(bp).connect(g).connect(this.out);
+    const o=C.createOscillator(); o.frequency.value=160; const og=C.createGain(); this.env(og,t,0.001,a*0.25,0.03); o.connect(og).connect(this.out); o.start(t); o.stop(t+0.06);
+  },
+  ping(){
+    if(!this.C) return; const C=this.C, t=C.currentTime;
+    const o=C.createOscillator(); o.frequency.setValueAtTime(5300,t); o.frequency.exponentialRampToValueAtTime(4700,t+0.25);
+    const g=C.createGain(); this.env(g,t,0.002,0.035,0.3); o.connect(g).connect(this.out); o.start(t); o.stop(t+0.4);
+    this.tick(0.7);
+  },
+  relayOff(){
+    if(!this.C) return; const C=this.C, t=C.currentTime;
+    const n=this.nsrc(t,0.12), lp=this.filt('lowpass',700), g=C.createGain(); this.env(g,t,0.001,0.5,0.07); n.connect(lp).connect(g).connect(this.out);
+    this.tink(t+0.01, 0.06);
+  },
+  ignite(){
+    if(!this.C) return; const C=this.C, t=C.currentTime;
+    const n=C.createBufferSource(); n.buffer=this.nb; n.loop=true;
+    const lp=this.filt('lowpass',200,2); lp.frequency.setValueAtTime(180,t); lp.frequency.exponentialRampToValueAtTime(1100,t+0.35); lp.frequency.exponentialRampToValueAtTime(300,t+1.0);
+    const g=C.createGain(); g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.35,t+0.18); g.gain.exponentialRampToValueAtTime(0.0001,t+1.1);
+    n.connect(lp).connect(g).connect(this.out); n.start(t); n.stop(t+1.2);
+    for(let i=0;i<6;i++) this.pop(t+0.05+Math.random()*0.6, 0.05+Math.random()*0.08);
+  },
+  pop(t, a){
+    const C=this.C; t = t ?? C.currentTime;
+    const n=this.nsrc(t,0.02), bp=this.filt('bandpass',1500+Math.random()*2500,3), g=C.createGain(); this.env(g,t,0.0005,a,0.006+Math.random()*0.01); n.connect(bp).connect(g).connect(this.out);
+  },
+  update(main, glow, creakLvl, creakRate){
+    if(!this.C) return; const t=this.C.currentTime;
+    this.hum.gain.setTargetAtTime(main*0.04, t, 0.008);
+    this.buzz.gain.setTargetAtTime(glow*0.028, t, 0.05);
+    this.creakG.gain.setTargetAtTime(creakLvl*0.5, t, 0.015);
+    this.creakO.frequency.setTargetAtTime(Math.max(20,creakRate), t, 0.02);
+  }
+};
+
+/* ------------------------------------------------------------------ *
+ *  STATE
+ * ------------------------------------------------------------------ */
+const reduceMotion = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+const TH = 0.45, K = 26, FS = 10, FK = 6, INERTIA = 0.08, REST = 0.28;
+const startDark = !!(window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+let T = 0;
+let dark = startDark;
+const P = { th: dark ? -TH : TH, w: 0, stuck: true, strain: 0, tau: 0 };
+let hand = { mode: null };
+let jam = 0, firstTap = true, justJammed = false, lastToggleT = 0, toggles = 0, midT = 0, arcing = false;
+const L = { main: 0, glow: 0, glowT: dark?1:0, pilot: 0, pilotT: dark?1:0, night: dark?1:0.6, nightT: dark?1:0.6, flash: 0, expo: dark?1.45:1.0 };
+let shake = 0;
+const Q = [];
+function after(sec, fn, tag){ Q.push({at: T+sec, fn, tag}); }
+function cancel(tag){ for(let i=Q.length-1;i>=0;i--) if(Q[i].tag===tag) Q.splice(i,1); }
+
+document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+cv.setAttribute('aria-checked', String(dark));
+
+let hintTO = null;
+function say(text, dur){
+  hintEl.textContent = text; hintEl.classList.add('show');
+  clearTimeout(hintTO);
+  if(dur) hintTO = setTimeout(() => hintEl.classList.remove('show'), dur*1000);
+}
+
+/* fluorescent tubes struggling to start */
+function starter(silent){
+  const S = silent ? {tick(){},ping(){}} : Snd;
+  const seq = [
+    [0.25, 0.20, 0.35], [0.30, 0, 0],
+    [0.62, 0.32, 0.45], [0.69, 0, 0],
+    [0.98, 0.55, 0.5],  [1.02, 0.08, 0], [1.08, 0.85, 0], [1.12, 0.22, 0],
+  ];
+  seq.forEach(([at, lv, tk]) => after(at, () => { L.main = lv; if(tk) S.tick(tk); }, 'L'));
+  after(1.2, () => { L.main = 1; L.nightT = 0; S.ping(); }, 'L');
+}
+
+function setDark(on){
+  if(dark === on) return;
+  dark = on; lastToggleT = T; toggles++;
+  document.documentElement.dataset.theme = on ? 'dark' : 'light';
+  cv.setAttribute('aria-checked', String(on));
+  cancel('L');
+  if(on){
+    Snd.relayOff();
+    L.main = 0.45; L.nightT = 1;
+    after(0.035, () => L.main = 0, 'L');
+    after(0.09,  () => { L.main = 0.3; Snd.tick(0.35); }, 'L');
+    after(0.13,  () => L.main = 0, 'L');
+    after(0.20,  () => L.main = 0.1, 'L');
+    after(0.24,  () => L.main = 0, 'L');
+    after(0.10,  () => L.pilotT = 1, 'L');
+    after(0.30,  () => { L.glowT = 1; Snd.ignite(); }, 'L');
+  } else {
+    L.glowT = 0; L.pilotT = 0; L.nightT = 0.6;
+    starter(false);
+  }
+  if(toggles === 1) setTimeout(() => hintEl.classList.remove('show'), 1800);
+}
+
+/* ------------------------------------------------------------------ *
+ *  PARTICLES (3D, projected onto the overlay)
+ * ------------------------------------------------------------------ */
+const parts = [];
+const motes = [];
+for(let i=0;i<34;i++) motes.push({p:[(Math.random()-0.5)*3.4, Math.random()*3-1.4, 0.2+Math.random()*1.6], ph:Math.random()*10, s:0.5+Math.random()*1.3});
+function rodCrossing(){ const al = (0.07+0.55)/Math.cos(P.th); return [0, 0.15 + al*Math.sin(P.th), 0.09]; }
+function sparks(s){
+  if(reduceMotion) s *= 0.4;
+  const o = rodCrossing(); const n = Math.round(10 + 34*s);
+  for(let i=0;i<n;i++){
+    const sp = 0.6 + s*0.9;
+    parts.push({k:0, p:[o[0]+(Math.random()-0.5)*0.05, o[1]+(Math.random()-0.5)*0.05, o[2]],
+      v:[(Math.random()-0.5)*2.6*sp, (Math.random()*2.4-0.5)*sp, (0.4+Math.random()*2.2)*sp], age:0, life:0.2+Math.random()*0.55});
+  }
+  L.flash = Math.max(L.flash, 0.5 + 0.7*s);
+}
+function dust(s){
+  if(reduceMotion) s *= 0.4;
+  const n = Math.round(46*s);
+  for(let i=0;i<n;i++){
+    let x, y; const r = Math.random();
+    if(r < 0.6){ const side = Math.random()<0.5?-1:1; x = side*(0.085+0.04+Math.random()*0.04); y = 0.15 + (Math.random()*2-1)*0.45; }
+    else if(r < 0.82){ x = (Math.random()*2-1)*0.72; y = -1.02 + Math.random()*0.05; }
+    else { x = (Math.random()<0.5?-0.6:0.6) + (Math.random()-0.5)*0.1; y = (Math.random()<0.5?-0.92:0.92) + (Math.random()-0.5)*0.1; }
+    const flake = Math.random() < 0.18;
+    parts.push({k: flake?2:1, p:[x, y, 0.1+Math.random()*0.03],
+      v:[(Math.random()-0.5)*0.25*s, (Math.random()*0.25)*s, (0.05+Math.random()*0.35)*s], age:0,
+      life: 1.2+Math.random()*1.6, size: flake ? 2.2+Math.random()*2.5 : 0.7+Math.random()*1.4, rot:Math.random()*6, vr:(Math.random()-0.5)*14,
+      tone: Math.random()});
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  PHYSICS — rusty over-centre toggle with stick-slip friction
+ * ------------------------------------------------------------------ */
+function springTorque(th){ return K*Math.tanh(th/0.06)*(0.65+0.35*Math.min(1, Math.abs(th)/TH)); }
+const g2 = (x,c,w) => { const u=(x-c)/w; return Math.exp(-u*u); };
+function notch(th){ return 7*g2(th,0.21,0.035) + 9*g2(th,-0.16,0.03) + 5*g2(th,0.34,0.02) + 4*g2(th,-0.31,0.025); }
+function handTorque(){
+  if(hand.mode === 'drag'){ if(hand.slipped) return 0; return 380*(hand.target - P.th) - 3*P.w; }
+  if(hand.mode === 'push'){ return hand.dir*58*Math.min(1, (T-hand.start)/0.18); }
+  return 0;
+}
+function onImpact(v){
+  const s = Math.min(1, Math.abs(v)/22);
+  if(s < 0.03) return;
+  Snd.clunk(s);
+  if(!reduceMotion) shake = Math.max(shake, s);
+  if(s > 0.15) dust(s);
+}
+function onCross(){
+  jam = 0;
+  if(hand.mode === 'drag') hand.slipped = true;
+  if(hand.mode === 'push') hand.mode = null;
+  const s = Math.min(1, Math.abs(P.w)/16);
+  if(Math.abs(P.w) > 1.5){ sparks(s); Snd.arc(0.06 + 0.1*s, 0.4 + 0.6*s); }
+}
+function onBreak(excess, total){
+  Snd.krk(Math.min(1, excess/14 + total/90));
+  if(jam > 0 && total > 40){ jam = 0; if(!reduceMotion) shake = Math.max(shake, 0.35); dust(0.35); }
+}
+function atStop(side){ if((side < 0) !== dark) setDark(side < 0); }
+function step(h){
+  const tauH = handTorque();
+  const tau = springTorque(P.th) + tauH;
+  P.tau = tauH;
+  const nt = notch(P.th);
+  const fs = FS + jam + nt*1.6, fk = FK + nt;
+  if(P.th >= TH-1e-6 && tau >= 0 && P.w >= 0){ P.th = TH; P.w = 0; P.stuck = true; P.strain = 0; atStop(1); return; }
+  if(P.th <= -TH+1e-6 && tau <= 0 && P.w <= 0){ P.th = -TH; P.w = 0; P.stuck = true; P.strain = 0; atStop(-1); return; }
+  if(P.stuck){
+    P.strain = Math.abs(tau)/fs;
+    if(Math.abs(tau) <= fs) return;
+    P.stuck = false; onBreak(Math.abs(tau)-fs, Math.abs(tau));
+  }
+  P.strain = 0;
+  const dir = P.w !== 0 ? Math.sign(P.w) : Math.sign(tau);
+  const nw = P.w + (tau - dir*fk)/INERTIA*h;
+  if(Math.sign(nw) !== dir && Math.abs(tau) <= fs){ P.w = 0; P.stuck = true; return; }
+  P.w = nw;
+  const prev = P.th;
+  P.th += P.w*h;
+  if(prev !== 0 && Math.sign(prev) !== Math.sign(P.th)) onCross();
+  if(P.th > TH){ P.th = TH; if(P.w > 0){ const v = P.w; P.w = -P.w*REST; onImpact(v); if(Math.abs(P.w) < 0.6){ P.w = 0; P.stuck = true; } } atStop(1); }
+  if(P.th < -TH){ P.th = -TH; if(P.w < 0){ const v = P.w; P.w = -P.w*REST; onImpact(v); if(Math.abs(P.w) < 0.6){ P.w = 0; P.stuck = true; } } atStop(-1); }
+}
+
+/* ------------------------------------------------------------------ *
+ *  INPUT
+ * ------------------------------------------------------------------ */
+let ptr = null;
+function tap(){
+  Snd.init();
+  if(hand.mode) return;
+  const dir = P.th > 0 ? -1 : 1;
+  const jammed = !justJammed && (firstTap || (T - lastToggleT > 8 && Math.random() < 0.3));
+  firstTap = false; justJammed = false;
+  if(jammed) jam = 42;
+  hand = { mode:'push', dir, start:T };
+  const from = Math.sign(P.th);
+  after(0.6, () => {
+    if(hand.mode === 'push'){
+      hand.mode = null;
+      if(Math.sign(P.th) === from){
+        jam = 7; justJammed = true;
+        Snd.clunk(0.22); dust(0.3);
+        if(!reduceMotion) shake = Math.max(shake, 0.25);
+        say('RUSTED SOLID — HIT IT AGAIN', 2.4);
+      }
+    }
+  }, 'H');
+}
+cv.addEventListener('pointerdown', e => {
+  Snd.init();
+  cv.setPointerCapture(e.pointerId);
+  ptr = { id:e.pointerId, x0:e.clientX, y0:e.clientY, th0:P.th, dragging:false };
+});
+cv.addEventListener('pointermove', e => {
+  if(!ptr || e.pointerId !== ptr.id) return;
+  const dy = e.clientY - ptr.y0, dx = e.clientX - ptr.x0;
+  if(!ptr.dragging && Math.hypot(dx,dy) > 6){
+    ptr.dragging = true; cv.classList.add('grabbing');
+    if(hand.mode === 'push') cancel('H');
+    firstTap = false;
+    if(!justJammed && T - lastToggleT > 8 && Math.random() < 0.3) jam = 42;
+    justJammed = false;
+    hand = { mode:'drag', target:P.th, slipped:false };
+    ptr.th0 = P.th; ptr.y0 = e.clientY;
+  }
+  if(ptr.dragging && hand.mode === 'drag'){
+    const radPerPx = (2*TH)/(0.30*innerHeight);
+    hand.target = Math.max(-TH-0.6, Math.min(TH+0.6, ptr.th0 - (e.clientY - ptr.y0)*radPerPx));
+  }
+});
+function endPtr(e){
+  if(!ptr || e.pointerId !== ptr.id) return;
+  if(ptr.dragging){ if(hand.mode === 'drag') hand.mode = null; }
+  else tap();
+  ptr = null; cv.classList.remove('grabbing');
+}
+cv.addEventListener('pointerup', endPtr);
+cv.addEventListener('pointercancel', e => { if(ptr && ptr.dragging && hand.mode==='drag') hand.mode = null; ptr = null; cv.classList.remove('grabbing'); });
+cv.addEventListener('keydown', e => { if(e.key === ' ' || e.key === 'Enter'){ e.preventDefault(); tap(); } });
+sndBtn.addEventListener('click', () => {
+  Snd.init(); Snd.setOn(!Snd.on);
+  sndBtn.textContent = Snd.on ? 'SOUND ON' : 'SOUND OFF';
+  sndBtn.setAttribute('aria-pressed', String(Snd.on));
+});
+document.addEventListener('visibilitychange', () => { if(Snd.C){ document.hidden ? Snd.C.suspend() : Snd.C.resume(); } });
+
+/* ------------------------------------------------------------------ *
+ *  CAMERA + RESIZE
+ * ------------------------------------------------------------------ */
+const FOV = 36*Math.PI/180, FL = 0.5/Math.tan(FOV/2);
+let W = 1, H = 1, dpr = 1, scale = 1, maxScale = 1;
+const cam = { eye:[0,0,4], tgt:[0,0,0] };
+const sub = (a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const dot = (a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm = a => { const l=Math.hypot(a[0],a[1],a[2]); return [a[0]/l,a[1]/l,a[2]/l]; };
+const cross = (a,b)=>[a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+let baseEye = [0,0,4], baseTgt = [0.02,0.08,0.15];
+function layout(){
+  W = innerWidth; H = innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  maxScale = Math.min(dpr, 1.5);
+  if(!scale || scale > maxScale) scale = maxScale;
+  cv.width = Math.max(1, Math.floor(W*scale)); cv.height = Math.max(1, Math.floor(H*scale));
+  fx.width = Math.floor(W*dpr); fx.height = Math.floor(H*dpr);
+  const asp = W/H;
+  let dist = 4.1;
+  const visW = 2*dist*Math.tan(FOV/2)*asp;
+  if(visW < 2.0) dist *= 2.0/visW;
+  const d = norm([0.38, 0.30, 1.0]);
+  baseEye = [baseTgt[0]+d[0]*dist, baseTgt[1]+d[1]*dist, baseTgt[2]+d[2]*dist];
+}
+addEventListener('resize', layout);
+layout();
+function project(p){
+  const f = norm(sub(cam.tgt, cam.eye)), r = norm(cross(f,[0,1,0])), u = cross(r,f);
+  const q = sub(p, cam.eye);
+  const z = dot(q,f); if(z <= 0.01) return null;
+  return [W/2 + dot(q,r)/z*FL*H, H/2 - dot(q,u)/z*FL*H, z];
+}
+
+/* ------------------------------------------------------------------ *
+ *  LOOP
+ * ------------------------------------------------------------------ */
+if(dark){ L.glow = 1; L.pilot = 1; after(0.4, ()=>{}, 'L'); }
+else { starter(true); }
+setTimeout(() => { if(toggles === 0) say('DRAG THE LEVER — OR JUST HIT IT'); }, 1600);
+
+let last = performance.now(), ftAcc = 0, ftN = 0, frameNo = 0;
+function frame(now){ tick(now); requestAnimationFrame(frame); }
+function tick(now){
+  const dt = Math.min(0.05, (now-last)/1000); last = now; T += dt; frameNo++;
+  for(let i=0;i<Q.length;){ if(Q[i].at <= T){ const e = Q.splice(i,1)[0]; e.fn(); } else i++; }
+
+  const N = 12; for(let i=0;i<N;i++) step(dt/N);
+
+  // half-thrown: contacts arcing
+  const mid = P.stuck && !hand.mode && Math.abs(P.th) < 0.09;
+  midT = mid ? midT + dt : 0;
+  const wasArcing = arcing; arcing = midT > 0.25;
+  if(arcing && !wasArcing) say('HALF-THROWN. FINISH THE JOB.', 3);
+  let flick = 1;
+  if(arcing){
+    if(Math.random() < dt*7){ sparks(0.3); Snd.arc(0.06+Math.random()*0.14, 0.45); }
+    flick = Math.random() < 0.45 ? 0.15 + Math.random()*0.5 : 1;
+  }
+
+  // lights
+  const k = (rate) => 1 - Math.exp(-dt*rate);
+  L.glow += (L.glowT - L.glow)*k(L.glowT > L.glow ? 2.2 : 4);
+  L.pilot += (L.pilotT - L.pilot)*k(L.pilotT > L.pilot ? 14 : 8);
+  L.night += (L.nightT - L.night)*k(3);
+  L.expo += ((dark ? 1.45 : 1.0) - L.expo)*k(2.5);
+  L.flash *= Math.exp(-dt*13);
+  let main = L.main*(arcing ? flick : 1);
+  if(arcing && dark && Math.random() < 0.12) main = 0.25;
+  if(main > 0.9) main *= 0.992 + 0.008*Math.sin(T*377);
+  const gflick = 0.86 + 0.1*Math.sin(T*7.3)*Math.sin(T*3.1+1) + 0.06*Math.sin(T*23.7) - (Math.random()<0.02 ? 0.25 : 0);
+  const glow = L.glow*gflick*(arcing ? 0.5+Math.random()*0.7 : 1);
+
+  // audio per frame
+  if(Snd.C){
+    let cl = 0, cr = 60;
+    if(P.stuck && hand.mode){ cl = Math.max(0, Math.min(1, (P.strain-0.45)*1.4))*0.7; cr = 34 + 26*P.strain + (Math.random()-0.5)*14; }
+    else if(!P.stuck && Math.abs(P.w) < 9 && Math.abs(P.w) > 0.04){ cl = Math.min(1, Math.abs(P.w)/2.2)*(0.8 + notch(P.th)/12); cr = 60 + Math.abs(P.w)*34 + (Math.random()-0.5)*40; }
+    Snd.update(main, L.glow, cl, cr);
+    if(L.glow > 0.5 && Math.random() < dt*2.2) Snd.pop(undefined, 0.02 + Math.random()*0.05);
+  }
+
+  // strain jitter on lever while you heave on it
+  let rth = P.th;
+  if(P.stuck && hand.mode && P.strain > 0.5){ const a = Math.min(1,(P.strain-0.5)*1.5); rth += (Math.sin(T*97)*0.6 + Math.sin(T*151)*0.4)*0.006*a; }
+
+  // camera shake
+  shake *= Math.exp(-dt*7);
+  const sa = shake*0.028;
+  const so = [ (Math.sin(T*61)+Math.sin(T*97+1))*0.5*sa, (Math.sin(T*73+2)+Math.sin(T*109))*0.5*sa, 0 ];
+  cam.eye = [baseEye[0]+so[0], baseEye[1]+so[1], baseEye[2]];
+  cam.tgt = [baseTgt[0]+so[0]*0.6, baseTgt[1]+so[1]*0.6, baseTgt[2]];
+
+  // render
+  gl.viewport(0,0,cv.width,cv.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform2f(U.uRes, cv.width, cv.height);
+  gl.uniform1f(U.uTime, T);
+  gl.uniform3fv(U.uEye, cam.eye); gl.uniform3fv(U.uTgt, cam.tgt);
+  gl.uniform1f(U.uFl, FL);
+  gl.uniform3f(U.uLd, 0, Math.sin(rth), Math.cos(rth));
+  gl.uniform3f(U.uLn, 0, Math.cos(rth), -Math.sin(rth));
+  gl.uniform1f(U.uMain, main);
+  gl.uniform1f(U.uGlow, glow);
+  gl.uniform1f(U.uPilot, L.pilot*(0.94+0.06*Math.sin(T*50)));
+  gl.uniform1f(U.uFlash, L.flash);
+  gl.uniform1f(U.uNight, L.night);
+  gl.uniform1f(U.uExpo, L.expo);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // particles
+  drawFx(dt, main, glow);
+
+  // adaptive resolution
+  if(frameNo > 30){ ftAcc += dt; ftN++; if(ftN >= 40){ const avg = ftAcc/ftN; ftAcc = 0; ftN = 0;
+    if(avg > 1/42 && scale > 0.5){ scale = Math.max(0.5, scale*0.85); layout(); }
+    else if(avg < 1/58 && scale < maxScale){ scale = Math.min(maxScale, scale*1.08); layout(); } } }
+}
+
+function drawFx(dt, main, glow){
+  const c = fctx;
+  c.setTransform(dpr,0,0,dpr,0,0);
+  c.clearRect(0,0,W,H);
+  // floating dust motes in the tube light
+  if(main > 0.05 && !reduceMotion){
+    c.globalCompositeOperation = 'source-over';
+    for(const m of motes){
+      m.ph += dt*0.25;
+      const p = [m.p[0] + Math.sin(m.ph)*0.08, m.p[1] + Math.sin(m.ph*0.7+1)*0.06 - ((T*0.02)%0.5), m.p[2]];
+      const pr = project(p); if(!pr) continue;
+      c.fillStyle = `rgba(235,240,230,${0.16*main})`;
+      c.beginPath(); c.arc(pr[0], pr[1], m.s*1.8/pr[2]*2, 0, 6.283); c.fill();
+    }
+  }
+  for(let i=parts.length-1;i>=0;i--){
+    const q = parts[i];
+    q.age += dt;
+    if(q.age >= q.life){ parts.splice(i,1); continue; }
+    const g = q.k===0 ? 7.5 : q.k===1 ? 0.7 : 1.4;
+    const drag = q.k===0 ? 0.6 : q.k===1 ? 2.2 : 3.0;
+    q.v[1] -= g*dt;
+    for(let j=0;j<3;j++) q.v[j] *= Math.exp(-drag*dt);
+    if(q.k===2){ q.v[0] += Math.sin(q.age*9+q.rot)*dt*0.6; q.rot += q.vr*dt; }
+    for(let j=0;j<3;j++) q.p[j] += q.v[j]*dt;
+    if(q.p[2] < 0.075 && Math.abs(q.p[0])<0.75 && Math.abs(q.p[1])<1.05){ q.p[2] = 0.075; q.v[2] = Math.abs(q.v[2])*0.35; q.v[0]*=0.6; q.v[1]*=0.6; }
+    else if(q.p[2] < 0.0){ q.p[2] = 0.0; q.v[2] = Math.abs(q.v[2])*0.35; }
+  }
+  // sparks additive
+  c.globalCompositeOperation = 'lighter';
+  c.lineCap = 'round';
+  for(const q of parts){
+    if(q.k !== 0) continue;
+    const a = q.p, b = [q.p[0]-q.v[0]*0.028, q.p[1]-q.v[1]*0.028, q.p[2]-q.v[2]*0.028];
+    const pa = project(a), pb = project(b); if(!pa || !pb) continue;
+    const life = 1 - q.age/q.life;
+    const hot = Math.max(0, life*1.4-0.4);
+    const r = 255, gg = Math.round(140 + 115*hot), bb = Math.round(40 + 200*hot*hot);
+    c.strokeStyle = `rgba(${r},${gg},${bb},${Math.min(1,life*1.3)})`;
+    c.lineWidth = 1.1 + 1.4*life;
+    c.beginPath(); c.moveTo(pb[0],pb[1]); c.lineTo(pa[0],pa[1]); c.stroke();
+    c.fillStyle = `rgba(255,${gg},${bb},${0.18*life})`;
+    c.beginPath(); c.arc(pa[0],pa[1], 5*life, 0, 6.283); c.fill();
+  }
+  // rust dust + flakes
+  c.globalCompositeOperation = 'source-over';
+  for(const q of parts){
+    if(q.k === 0) continue;
+    const pr = project(q.p); if(!pr) continue;
+    const life = 1 - q.age/q.life;
+    const fade = Math.min(1, life*2.5) * Math.min(1, q.age*8);
+    const near = Math.exp(-Math.hypot(q.p[0], q.p[1]-0.15)*3.5);
+    const lit = Math.min(1, main*0.9 + glow*near*0.8 + 0.12);
+    const base = q.tone < 0.5 ? [120,58,26] : [160,86,38];
+    const tint = dark ? [base[0]*1.4, base[1]*0.9, base[2]*0.5] : base;
+    const col = `rgba(${Math.round(tint[0]*lit)},${Math.round(tint[1]*lit)},${Math.round(tint[2]*lit)},${0.85*fade})`;
+    c.fillStyle = col;
+    const s = q.size*(2.6/pr[2]);
+    if(q.k === 2){
+      c.save(); c.translate(pr[0],pr[1]); c.rotate(q.rot); c.scale(1, 0.35+0.65*Math.abs(Math.sin(q.rot*1.3)));
+      c.fillRect(-s, -s*0.7, s*2, s*1.4); c.restore();
+    } else {
+      c.fillRect(pr[0]-s/2, pr[1]-s/2, s, s);
+    }
+  }
+}
+
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
